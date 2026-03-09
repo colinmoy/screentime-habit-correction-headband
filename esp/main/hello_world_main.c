@@ -1,52 +1,105 @@
-/*
- * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-
 #include <stdio.h>
-#include <inttypes.h>
-#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_system.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+
+// ESP32-C6 Pin Definitions
+#define BUTTON_POSTURE   GPIO_NUM_4
+#define BUTTON_DISTANCE  GPIO_NUM_5
+#define LED_WARNING      GPIO_NUM_21
+#define LED_POSTURE_ALARM GPIO_NUM_22
+#define LED_DISTANCE_ALARM GPIO_NUM_23
 
 void app_main(void)
 {
-    printf("Hello world!\n");
+    // 1. Configure Input Buttons (with internal pull-ups)
+    gpio_config_t io_conf_in = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BUTTON_POSTURE) | (1ULL << BUTTON_DISTANCE),
+        .pull_down_en = 0,
+        .pull_up_en = 1
+    };
+    gpio_config(&io_conf_in);
 
-    /* Print chip information */
-    esp_chip_info_t chip_info;
-    uint32_t flash_size;
-    esp_chip_info(&chip_info);
-    printf("This is %s chip with %d CPU core(s), %s%s%s%s, ",
-           CONFIG_IDF_TARGET,
-           chip_info.cores,
-           (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "",
-           (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
-           (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
-           (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
+    // 2. Configure Output LEDs
+    gpio_config_t io_conf_out = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = (1ULL << LED_WARNING) | (1ULL << LED_POSTURE_ALARM) | (1ULL << LED_DISTANCE_ALARM),
+        .pull_down_en = 0,
+        .pull_up_en = 0
+    };
+    gpio_config(&io_conf_out);
 
-    unsigned major_rev = chip_info.revision / 100;
-    unsigned minor_rev = chip_info.revision % 100;
-    printf("silicon revision v%d.%d, ", major_rev, minor_rev);
-    if(esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
-        printf("Get flash size failed");
-        return;
+    printf("System Ready. Monitoring posture and screen distance...\n");
+
+    // Timing and State Variables
+    uint32_t postureStartTime = 0;
+    uint32_t distanceStartTime = 0;
+    const uint32_t thresholdDelay = 3000; // 3.0 seconds
+
+    bool postureWarningActive = false;
+    bool distanceWarningActive = false;
+    bool postureAlarmActive = false;
+    bool distanceAlarmActive = false;
+
+    // Equivalent to Arduino's loop()
+    while (1) {
+        // Read simulated sensor states (0 means pressed due to pull-up)
+        bool postureBad = (gpio_get_level(BUTTON_POSTURE) == 0);
+        bool distanceBad = (gpio_get_level(BUTTON_DISTANCE) == 0);
+
+        // Get current time in milliseconds
+        uint32_t currentMillis = esp_timer_get_time() / 1000;
+
+        // --- Posture Logic (IMU Simulation) ---
+        if (postureBad) {
+            if (!postureWarningActive) {
+                postureWarningActive = true;
+                postureStartTime = currentMillis;
+                printf("[WARNING] Bad posture detected. Activating moderate feedback.\n");
+            }
+            
+            if (!postureAlarmActive && (currentMillis - postureStartTime >= thresholdDelay)) {
+                postureAlarmActive = true;
+                printf("[ALARM] Posture threshold exceeded (3s). Activating full feedback.\n");
+            }
+        } else {
+            if (postureWarningActive || postureAlarmActive) {
+                printf("[IDLE] Posture corrected.\n");
+            }
+            postureWarningActive = false;
+            postureAlarmActive = false;
+        }
+
+        // --- Distance Logic (ToF Simulation) ---
+        if (distanceBad) {
+            if (!distanceWarningActive) {
+                distanceWarningActive = true;
+                distanceStartTime = currentMillis;
+                printf("[WARNING] Screen too close. Activating moderate feedback.\n");
+            }
+            
+            if (!distanceAlarmActive && (currentMillis - distanceStartTime >= thresholdDelay)) {
+                distanceAlarmActive = true;
+                printf("[ALARM] Distance threshold exceeded (3s). Activating full feedback.\n");
+            }
+        } else {
+            if (distanceWarningActive || distanceAlarmActive) {
+                printf("[IDLE] Distance corrected.\n");
+            }
+            distanceWarningActive = false;
+            distanceAlarmActive = false;
+        }
+
+        // --- Hardware Output Control ---
+        gpio_set_level(LED_WARNING, (postureWarningActive || distanceWarningActive) ? 1 : 0);
+        gpio_set_level(LED_POSTURE_ALARM, postureAlarmActive ? 1 : 0);
+        gpio_set_level(LED_DISTANCE_ALARM, distanceAlarmActive ? 1 : 0);
+
+        // Yield to the FreeRTOS scheduler to prevent watchdog timer resets
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
-
-    printf("%" PRIu32 "MB %s flash\n", flash_size / (uint32_t)(1024 * 1024),
-           (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
-
-    printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
-
-    for (int i = 10; i >= 0; i--) {
-        printf("Restarting in %d seconds...\n", i);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-    printf("Restarting now.\n");
-    fflush(stdout);
-    esp_restart();
 }
