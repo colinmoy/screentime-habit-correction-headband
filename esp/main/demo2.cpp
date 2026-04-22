@@ -27,6 +27,7 @@
 #define I2C_MASTER_FREQ_HZ          100000
 
 #define VL53L0X_ADDRESS             0x29
+#define VL53L0X_XSHUT_PIN           GPIO_NUM_2
 
 #define PWM_TIMER                   LEDC_TIMER_0
 #define PWM_MODE                    LEDC_LOW_SPEED_MODE
@@ -41,6 +42,9 @@ const uint32_t thresholdDelay  = 3000;
 const float    maxOutputPercent = 50.0;
 
 static const char *TAG = "HEADBAND";
+
+// ─── VL53L0X stop variable (read from NVM during init) ────────────────────────
+static uint8_t stop_var = 0;
 
 // ─── Shared session data ──────────────────────────────────────────────────────
 static volatile bool     newSessionReady  = false;
@@ -70,94 +74,32 @@ esp_err_t read_reg16(uint8_t reg, uint16_t *val) {
 // ─── VL53L0X ─────────────────────────────────────────────────────────────────
 
 esp_err_t vl53l0x_simple_init() {
+    // Pull LOW to reset, then HIGH to activate
+    gpio_set_level(VL53L0X_XSHUT_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(VL53L0X_XSHUT_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     uint8_t val;
     if (read_reg(0xC0, &val) != ESP_OK || val != 0xEE) {
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "VL53L0X found (0x%02X)", val);
-    write_reg(0x88, 0x00);
+
+    // Read stop variable from NVM — required for measurement sequence
     write_reg(0x80, 0x01);
     write_reg(0xFF, 0x01);
     write_reg(0x00, 0x00);
-    write_reg(0xFF, 0x00);
-    write_reg(0x09, 0x00);
-    write_reg(0x10, 0x00);
-    write_reg(0x11, 0x00);
-    write_reg(0x24, 0x01);
-    write_reg(0x25, 0xff);
-    write_reg(0x75, 0x00);
-    write_reg(0xFF, 0x01);
-    write_reg(0x4e, 0x2c);
-    write_reg(0x48, 0x00);
-    write_reg(0x30, 0x20);
-    write_reg(0xFF, 0x00);
-    write_reg(0x30, 0x09);
-    write_reg(0x54, 0x00);
-    write_reg(0x31, 0x04);
-    write_reg(0x32, 0x03);
-    write_reg(0x40, 0x83);
-    write_reg(0x46, 0x25);
-    write_reg(0x60, 0x00);
-    write_reg(0x27, 0x00);
-    write_reg(0x50, 0x06);
-    write_reg(0x51, 0x00);
-    write_reg(0x52, 0x96);
-    write_reg(0x56, 0x08);
-    write_reg(0x57, 0x30);
-    write_reg(0x61, 0x00);
-    write_reg(0x62, 0x00);
-    write_reg(0x64, 0x00);
-    write_reg(0x65, 0x00);
-    write_reg(0x66, 0xa0);
-    write_reg(0xFF, 0x01);
-    write_reg(0x22, 0x32);
-    write_reg(0x47, 0x14);
-    write_reg(0x49, 0xff);
-    write_reg(0x4a, 0x00);
-    write_reg(0xFF, 0x00);
-    write_reg(0x7a, 0x0a);
-    write_reg(0x7b, 0x00);
-    write_reg(0x78, 0x21);
-    write_reg(0xFF, 0x01);
-    write_reg(0x23, 0x34);
-    write_reg(0x42, 0x00);
-    write_reg(0x44, 0xff);
-    write_reg(0x45, 0x26);
-    write_reg(0x46, 0x05);
-    write_reg(0x40, 0x40);
-    write_reg(0x0e, 0x06);
-    write_reg(0x20, 0x1a);
-    write_reg(0x43, 0x40);
-    write_reg(0xFF, 0x00);
-    write_reg(0x34, 0x03);
-    write_reg(0x35, 0x44);
-    write_reg(0xFF, 0x01);
-    write_reg(0x31, 0x04);
-    write_reg(0x4b, 0x09);
-    write_reg(0x4c, 0x05);
-    write_reg(0x4d, 0x04);
-    write_reg(0xFF, 0x00);
-    write_reg(0x44, 0x00);
-    write_reg(0x45, 0x20);
-    write_reg(0x47, 0x08);
-    write_reg(0x48, 0x28);
-    write_reg(0x67, 0x00);
-    write_reg(0x70, 0x04);
-    write_reg(0x71, 0x01);
-    write_reg(0x72, 0xfe);
-    write_reg(0x76, 0x00);
-    write_reg(0x77, 0x00);
-    write_reg(0xFF, 0x01);
-    write_reg(0x0d, 0x01);
-    write_reg(0xFF, 0x00);
-    write_reg(0x80, 0x01);
-    write_reg(0x01, 0xf8);
-    write_reg(0xFF, 0x01);
-    write_reg(0x8e, 0x01);
+    read_reg(0x91, &stop_var);
+    ESP_LOGI(TAG, "VL53L0X stop_var = 0x%02X", stop_var);
     write_reg(0x00, 0x01);
     write_reg(0xFF, 0x00);
     write_reg(0x80, 0x00);
-    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Configure interrupt for new sample ready and clear any pending
+    write_reg(0x0A, 0x04);
+    write_reg(0x0B, 0x01);
+
     ESP_LOGI(TAG, "VL53L0X init complete");
     return ESP_OK;
 }
@@ -166,21 +108,29 @@ uint16_t vl53l0x_read_distance() {
     write_reg(0x80, 0x01);
     write_reg(0xFF, 0x01);
     write_reg(0x00, 0x00);
-    write_reg(0x91, 0x3C);
+    write_reg(0x91, stop_var);
     write_reg(0x00, 0x01);
     write_reg(0xFF, 0x00);
     write_reg(0x80, 0x00);
     write_reg(0x00, 0x01);
     vTaskDelay(pdMS_TO_TICKS(50));
-    uint8_t status;
+    // Wait for SYSRANGE_START bit 0 to clear — measurement has begun
+    uint8_t sysrange = 0;
     for (int i = 0; i < 100; i++) {
+        read_reg(0x00, &sysrange);
+        if (!(sysrange & 0x01)) break;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    // Wait for RESULT_INTERRUPT_STATUS bits [2:0] to go non-zero — result ready
+    uint8_t status = 0;
+    for (int i = 0; i < 200; i++) {
         read_reg(0x13, &status);
         if (status & 0x07) break;
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    uint16_t distance;
+    uint16_t distance = 0;
     read_reg16(0x1E, &distance);
-    write_reg(0x0B, 0x01);
+    write_reg(0x0B, 0x01);  // clear interrupt
     return distance;
 }
 
@@ -247,7 +197,11 @@ void start_http_server() {
 // ─── Wi-Fi Access Point ───────────────────────────────────────────────────────
 
 void wifi_init() {
-    nvs_flash_init();
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
     esp_netif_init();
     esp_event_loop_create_default();
     esp_netif_create_default_wifi_ap();
@@ -281,6 +235,11 @@ void wifi_init() {
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "  Posture Headband  ");
+
+    // Hold sensor in reset (LOW) for 500ms to ensure full discharge from uncontrolled boot
+    gpio_set_direction(VL53L0X_XSHUT_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(VL53L0X_XSHUT_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     wifi_init();
 
@@ -370,15 +329,26 @@ extern "C" void app_main(void)
     bool     distanceWarningActive = false;
     bool     distanceAlarmActive   = false;
     uint32_t lastPrintTime         = 0;
+    uint32_t lastSensorReset       = 0;
 
     while (1) {
+        uint32_t currentMillis = esp_timer_get_time() / 1000;
+
+        // Only reset sensor when idle — never during an active warning or alarm
+        if (!distanceWarningActive && !distanceAlarmActive &&
+            currentMillis - lastSensorReset >= 5000) {
+            if (vl53l0x_simple_init() != ESP_OK) {
+                ESP_LOGE(TAG, "Sensor re-init failed");
+            }
+            lastSensorReset = currentMillis;
+            continue;
+        }
+
         uint16_t distance_mm = vl53l0x_read_distance();
 
         if (distance_mm > 2000 || distance_mm == 0) {
             distance_mm = 1200;
         }
-
-        uint32_t currentMillis = esp_timer_get_time() / 1000;
 
         if (currentMillis - lastPrintTime >= 1000) {
             printf("Distance: %d mm (%.1f cm / %.2f inches)\n",
